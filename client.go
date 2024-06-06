@@ -45,13 +45,17 @@ var (
 	}
 )
 
+type AuthHandler interface {
+	Setup(req *http.Request) error
+}
+
 // postAPI makes an HTTP POST request to the given URL, sending the given body
 // and attaching the requested custom headers to the request. If there is no
 // error the HTTP response body and HTTP response object are returned, otherwise
 // an error is returned.. All POST requests include a `User-Agent` header
 // populated with the `userAgent` function and a `Content-Type` header of
 // `application/json`.
-func postAPI(url string, body []byte, headers map[string]string) ([]byte, *http.Response, error) {
+func postAPI(url string, body []byte, headers map[string]string, auth AuthHandler) ([]byte, *http.Response, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
@@ -65,6 +69,13 @@ func postAPI(url string, body []byte, headers map[string]string) ([]byte, *http.
 
 	for h, v := range headers {
 		req.Header.Set(h, v)
+	}
+
+	if auth != nil {
+		err := auth.Setup(req)
+		if err != nil {
+			return nil, nil, fmt.Errorf("Failed to setup authentication: %w", err)
+		}
 	}
 
 	resp, err := httpClient.Do(req)
@@ -111,6 +122,16 @@ func newClientError(msg string, respCode int, respBody []byte) ClientError {
 	}
 }
 
+type httpBasicAuthHandler struct {
+	username string
+	password string
+}
+
+func (h httpBasicAuthHandler) Setup(req *http.Request) error {
+	req.SetBasicAuth(h.username, h.password)
+	return nil
+}
+
 // Client is a struct that can be used to interact with an ACME DNS server to
 // register accounts and update TXT records.
 type Client struct {
@@ -126,10 +147,18 @@ func NewClient(url string) Client {
 	}
 }
 
-// RegisterAccount creates an Account with the ACME DNS server. The optional
+func NewHttpBasicAuth(username, password string) AuthHandler {
+	return httpBasicAuthHandler{
+		username: username,
+		password: password,
+	}
+}
+
+// RegisterAccountWithAuth creates an Account with the ACME DNS server. The optional
 // `allowFrom` argument is used to constrain which CIDR ranges can use the
 // created Account.
-func (c Client) RegisterAccount(allowFrom []string) (Account, error) {
+// `authHandler` can be passed to authenticate the request
+func (c Client) RegisterAccountWithAuth(allowFrom []string, auth AuthHandler) (Account, error) {
 	var body []byte
 
 	if len(allowFrom) > 0 {
@@ -150,7 +179,7 @@ func (c Client) RegisterAccount(allowFrom []string) (Account, error) {
 	url := fmt.Sprintf("%s/register", c.baseURL)
 
 	// golangci-lint doesn't know it but postAPI() defers a body close.
-	respBody, resp, err := postAPI(url, body, nil) //nolint:bodyclose
+	respBody, resp, err := postAPI(url, body, nil, auth) //nolint:bodyclose
 	if err != nil {
 		return Account{}, err
 	}
@@ -170,6 +199,12 @@ func (c Client) RegisterAccount(allowFrom []string) (Account, error) {
 	acct.ServerURL = c.baseURL
 
 	return acct, nil
+}
+
+// Same as RegisterAccountWithAuth(allowFrom, NewNoAuth())
+// provided for convenience and backwards compatibility
+func (c Client) RegisterAccount(allowFrom []string) (Account, error) {
+	return c.RegisterAccountWithAuth(allowFrom, nil)
 }
 
 // UpdateTXTRecord updates a TXT record with the ACME DNS server to the `value`
@@ -196,7 +231,7 @@ func (c Client) UpdateTXTRecord(account Account, value string) error {
 	url := fmt.Sprintf("%s/update", c.baseURL)
 
 	// golangci-lint doesn't know it but postAPI() defers a body close.
-	respBody, resp, err := postAPI(url, updateBody, headers) //nolint:bodyclose
+	respBody, resp, err := postAPI(url, updateBody, headers, nil) //nolint:bodyclose
 	if err != nil {
 		return err
 	}
